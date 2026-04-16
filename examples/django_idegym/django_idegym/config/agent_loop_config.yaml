@@ -1,0 +1,2 @@
+- name: idegym_django
+  _target_: examples.django_idegym.agent_loop.swemini_django_agent_loop.SWEMiniDjangoAgentLoop
