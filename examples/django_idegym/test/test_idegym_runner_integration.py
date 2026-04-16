@@ -19,7 +19,6 @@ import pytest
 from examples.django_idegym.agent_loop.idegym_runner import IDEGymRunner
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

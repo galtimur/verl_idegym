@@ -13,6 +13,10 @@ from abc import ABC, abstractmethod
 from types import SimpleNamespace
 from typing import Any
 
+# ---------------------------------------------------------------------------
+# Vendored from minisweagent to avoid external dependency
+# ---------------------------------------------------------------------------
+from jinja2 import StrictUndefined, Template
 from langchain_core.messages import (
     AIMessage,
     BaseMessage,
@@ -20,12 +24,6 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
-
-# ---------------------------------------------------------------------------
-# Vendored from minisweagent to avoid external dependency
-# ---------------------------------------------------------------------------
-
-from jinja2 import StrictUndefined, Template
 
 
 class FormatError(Exception):
@@ -146,7 +144,7 @@ def adapt_lc_tool_calls(lc_tool_calls: list[dict]) -> list[SimpleNamespace]:
     ]
 
 
-def convert_messages(strategy: "ParsingStrategy", agent_messages: list[dict]) -> list[BaseMessage]:
+def convert_messages(strategy: ParsingStrategy, agent_messages: list[dict]) -> list[BaseMessage]:
     return [strategy.convert_msg_to_lc(msg) for msg in agent_messages]
 
 

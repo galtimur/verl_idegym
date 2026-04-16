@@ -13,10 +13,8 @@ Ported from jetrl_django_idegym/scaffold/django_swemini_agent.py.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import logging
-import os
 import time
 import traceback
 import uuid
@@ -31,12 +29,10 @@ from jinja2 import StrictUndefined
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, convert_to_openai_messages
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, StateGraph
-from examples.django_idegym.agent_loop.agent_parsing_strategies import FormatError
 from openai import BadRequestError
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
-
 from examples.django_idegym.agent_loop.agent_parsing_strategies import (
+    FormatError,
     ParsingStrategy,
     TextStrategy,
     ToolcallStrategy,
@@ -49,6 +45,7 @@ from examples.django_idegym.utils.postprocessing import (
     parse_idegym_tests_output,
 )
 from examples.django_idegym.utils.reward_helper_fns import apply_reasoning_filter
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 
 logger = logging.getLogger(__name__)
 
@@ -325,25 +322,25 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
 
         rollout_cfg = self.rollout_config
-        # Custom parameters live under rollout_cfg.custom (a dict)
+        # Prefer agent_loop_config kwargs; fall back to rollout_cfg.custom for backward compat
         custom = getattr(rollout_cfg, "custom", None) or {}
 
-        self.max_turns = custom.get("max_turns", 10)
-        self.max_num_tests = custom.get("max_num_tests", 10)
-        self.max_test_output_symb = custom.get("max_test_output_symb", 10_000)
-        self.enable_thinking = custom.get("enable_thinking", False)
+        self.max_turns = kwargs.get("max_turns", custom.get("max_turns", 10))
+        self.max_num_tests = kwargs.get("max_num_tests", custom.get("max_num_tests", 10))
+        self.max_test_output_symb = kwargs.get("max_test_output_symb", custom.get("max_test_output_symb", 10_000))
+        self.enable_thinking = kwargs.get("enable_thinking", custom.get("enable_thinking", False))
 
-        keep_reasoning = custom.get("keep_reasoning", "none")
+        keep_reasoning = kwargs.get("keep_reasoning", custom.get("keep_reasoning", "none"))
         if keep_reasoning not in KEEP_REASONING_OPTIONS:
             keep_reasoning = "none"
         self.keep_reasoning = keep_reasoning
 
         # Parsing mode
-        agent_parsing_mode = custom.get("agent_parsing_mode", "toolcall")
+        agent_parsing_mode = kwargs.get("agent_parsing_mode", custom.get("agent_parsing_mode", "toolcall"))
         self.agent_parsing_mode = agent_parsing_mode
 
         # Prompts
-        prompts_file = custom.get("prompts_file", None)
+        prompts_file = kwargs.get("prompts_file", custom.get("prompts_file", None))
         self.agent_prompts = load_prompts(agent_parsing_mode, prompts_file)
 
         self._jinja_env = JinjaEnvironment(undefined=StrictUndefined)
@@ -358,11 +355,11 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             raise KeyError(f"Unknown agent_parsing_mode: {agent_parsing_mode}. Use: toolcall or text")
 
         # IDEGym runner
-        use_mock_runner = custom.get("use_mock_runner", False)
+        use_mock_runner = kwargs.get("use_mock_runner", custom.get("use_mock_runner", False))
         if use_mock_runner:
             from examples.django_idegym.agent_loop.mock_idegym_runner import MockIDEGymRunner
-            mock_error_rate = custom.get("mock_runner_error_rate", 0.001)
-            mock_pass_rate = custom.get("mock_runner_pass_rate", 0.7)
+            mock_error_rate = kwargs.get("mock_runner_error_rate", custom.get("mock_runner_error_rate", 0.001))
+            mock_pass_rate = kwargs.get("mock_runner_pass_rate", custom.get("mock_runner_pass_rate", 0.7))
             logger.info(f"[SCAFFOLD] Using MockIDEGymRunner (error_rate={mock_error_rate}, pass_rate={mock_pass_rate})")
             self.idegym_runner = MockIDEGymRunner(error_rate=mock_error_rate, pass_rate=mock_pass_rate)
         else:
@@ -570,8 +567,6 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         agent_config = config["configurable"]["agent_config"]
         sampling_params = config["configurable"]["sampling_params"]
 
-        item = state["dp_item"]
-        dp_id = item["dp_id"]
         state["turn"] += 1
         step = state["turn"]
 

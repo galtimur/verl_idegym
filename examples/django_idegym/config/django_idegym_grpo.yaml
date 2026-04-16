@@ -6,16 +6,23 @@ defaults:
   - ppo_trainer
   - _self_
 
+algorithm:
+  adv_estimator: grpo
 data:
-  max_prompt_length: 2048
+  max_prompt_length: 16000
   max_response_length: 4096
-  train_batch_size: 256
+  train_batch_size: 4
   return_raw_chat: True
+  train_files: JetBrains-Research/django_method_gen:train
+  val_files: JetBrains-Research/django_method_gen:test
+  custom_cls:
+    path: examples/django_idegym/hf_dataset.py
+    name: HFHubDataset
 
 actor_rollout_ref:
   hybrid_engine: True
   actor:
-    ppo_micro_batch_size_per_gpu: 2
+    use_dynamic_bsz: True
     ppo_mini_batch_size: 8
     use_kl_loss: True
     kl_loss_coef: 0.001
@@ -28,26 +35,14 @@ actor_rollout_ref:
     name: vllm
     response_length: 4096
     tensor_model_parallel_size: 1
-    gpu_memory_utilization: 0.5
+    gpu_memory_utilization: 0.6
     log_prob_micro_batch_size_per_gpu: 2
-    # SweMini agent settings (passed via custom dict)
-    custom:
-      enable_thinking: false
-      max_turns: 10
-      max_num_tests: 10
-      max_test_output_symb: 10000
-      keep_reasoning: "none"
-      agent_parsing_mode: "toolcall"  # "toolcall" or "text"
-      use_mock_runner: false
-      mock_runner_error_rate: 0.001
-      mock_runner_pass_rate: 0.7
-      prompts_file: null  # null = use default prompts for the parsing mode
-      trajectory_dir: null  # S3 path for trajectory saving, null = disabled
     multi_turn:
       enable: True
       max_assistant_turns: 10
       max_parallel_calls: 1
       format: hermes
+      tool_config_path: null
     agent:
       default_agent_loop: idegym_django
       agent_loop_config_path: examples/django_idegym/config/agent_loop_config.yaml
