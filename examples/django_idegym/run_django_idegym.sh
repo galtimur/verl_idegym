@@ -12,8 +12,10 @@ python3 -m verl.trainer.main_ppo \
     --config-name='django_idegym_grpo' \
     algorithm.adv_estimator=grpo \
     data.train_batch_size=8 \
-    data.train_files=$HOME/data/django/train.parquet \
-    data.val_files=$HOME/data/django/test.parquet \
+    data.train_files=JetBrains-Research/django_method_gen:train \
+    data.val_files=JetBrains-Research/django_method_gen:test \
+    data.custom_cls.path="${PROJECT_DIR}/examples/django_idegym/hf_dataset.py" \
+    data.custom_cls.name=HFHubDataset \
     actor_rollout_ref.model.path=Qwen/Qwen3-0.6B \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
