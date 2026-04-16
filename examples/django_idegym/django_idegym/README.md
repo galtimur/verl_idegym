@@ -25,62 +25,32 @@ Each `agent_step`:
 3. Executes commands on IDEGym server
 4. Renders observations back to conversation
 
-## Extra Dependencies
+## Installation
 
 ```bash
-pip install langchain-core langgraph aiohttp pyyaml jinja2 minisweagent
-# For real IDEGym (not mock):
-pip install idegym kubernetes-asyncio
-# Optional, for S3 trajectory logging:
-pip install s3fs
-```
-
-## Directory Structure
-
-```
-examples/django_idegym/
-├── agent_loop/
-│   ├── django_agent_loop.py           # SweMini agent loop + LangGraph nodes
-│   ├── chat_model.py                  # LangChain ChatModel wrapper for verl
-│   ├── agent_parsing_strategies.py    # Toolcall/Text parsing strategies
-│   ├── idegym_runner.py               # IDEGym cloud runner
-│   └── mock_idegym_runner.py          # Mock runner for testing
-├── reward/
-│   ├── django_reward.py               # Reward computation + standalone IDEGym client
-│   └── idegym_runner_utils.py         # ItemToRun dataclass
-├── utils/
-│   ├── postprocessing.py              # Code normalization, test parsing
-│   └── reward_helper_fns.py           # Code block extraction, reasoning filter
-├── prompts/
-│   ├── swemini_prompts.py             # Prompt loader
-│   ├── prompts_swemini_toolcall.yaml  # Toolcall mode prompts
-│   └── prompts_swemini_text.yaml      # Text mode prompts
-└── config/
-    ├── django_idegym_grpo.yaml        # Training config
-    └── agent_loop_config.yaml         # Agent loop registration
-```
-
-## IDEGym Setup
-
-Set environment variables for IDEGym access:
-```bash
-export ORCHESTRATOR_URL="http://idegym-orchestrator.idegym.svc.cluster.local"
-export IMAGE_TAG="your-django-image-tag"
-export IDEGYM_AUTH_USERNAME="your-username"
-export IDEGYM_AUTH_PASSWORD="your-password"
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[vllm]"
+uv pip install langchain-core langgraph aiohttp pyyaml pytest "datasets>=3.6"
+uv pip install flash-attn --no-build-isolation # Can take long time
+uv pip install idegym-{tools,api,backend-utils,client,common-utils,rewards}==0.7.3
 ```
 
 For testing without IDEGym, set `use_mock_runner: true` in the config.
 
+To test IDEgym:
+
+`pytest examples/django_idegym/test/test_idegym_runner_integration.py::test_idegym_smoke -v -s`
+
 ## Usage
 
 ```bash
-bash examples/django_idegym/run_django_idegym.sh
+./examples/django_idegym/run_django_idegym.sh
 ```
 
 With mock runner (no IDEGym needed):
 ```bash
-bash examples/django_idegym/run_django_idegym.sh \
+./examples/django_idegym/run_django_idegym.sh \
     actor_rollout_ref.rollout.use_mock_runner=true
 ```
 

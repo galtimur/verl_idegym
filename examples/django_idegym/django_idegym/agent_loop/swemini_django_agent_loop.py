@@ -369,21 +369,6 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             from examples.django_idegym.agent_loop.idegym_runner import IDEGymRunner
             self.idegym_runner = IDEGymRunner()
 
-        # S3 trajectory saving
-        self.fs = None
-        self.traj_bucket = None
-        trajectory_dir = custom.get("trajectory_dir", None)
-        if trajectory_dir:
-            try:
-                import s3fs
-                self.fs = s3fs.S3FileSystem()
-                trajectory_dir = trajectory_dir.rstrip("/")
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                experiment_name = getattr(self.config.trainer, "experiment_name", "default")
-                self.traj_bucket = f"{trajectory_dir}/traj_django_swemini_{experiment_name}_{timestamp}.jsonl"
-                print(f"[INFO] Trajectories will be saved to {self.traj_bucket}")
-            except Exception as e:
-                print(f"[WARNING] Failed to initialize S3 for trajectory saving: {e}")
 
     # --- Prompt rendering ---
 
@@ -795,18 +780,17 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             "dp_idx": dp_item.get("idx") if dp_item else None,
         }
 
-        # Save trajectory to S3
-        if self.traj_bucket and self.fs:
-            try:
-                state_dict = dataclass_to_dict(copy.deepcopy(state))
-                for mes in state_dict.get("messages", []):
-                    if isinstance(mes, dict):
-                        mes.pop("response_metadata", None)
-                with self.fs.open(self.traj_bucket, "a", encoding="utf-8") as f:
-                    json.dump(state_dict, f)
-                    f.write("\n")
-            except Exception as e:
-                logger.error(f"[FINALIZE] dp_id={dp_id} - Failed to upload trajectory: {e}")
+        # if self.traj_bucket and self.fs:
+        #     try:
+        #         state_dict = dataclass_to_dict(copy.deepcopy(state))
+        #         for mes in state_dict.get("messages", []):
+        #             if isinstance(mes, dict):
+        #                 mes.pop("response_metadata", None)
+        #         with self.fs.open(self.traj_bucket, "a", encoding="utf-8") as f:
+        #             json.dump(state_dict, f)
+        #             f.write("\n")
+        #     except Exception as e:
+        #         logger.error(f"[FINALIZE] dp_id={dp_id} - Failed to upload trajectory: {e}")
 
         return state
 
