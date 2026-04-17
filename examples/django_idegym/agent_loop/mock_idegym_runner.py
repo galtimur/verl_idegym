@@ -3,8 +3,6 @@ Mock IDEGymRunner for testing without a real IDEGym deployment.
 
 Drop-in replacement that returns plausible fake outputs and optionally
 injects errors to exercise error-handling paths.
-
-Ported from jetrl_django_idegym/reward/mock_idegym_runner.py.
 """
 
 from __future__ import annotations

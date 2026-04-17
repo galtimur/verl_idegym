@@ -3,8 +3,6 @@ IDEGym cloud test execution pipeline.
 
 Manages IdeGYMClient/Server lifecycle and provides methods for running
 bash commands, editing files, and executing tests on remote IDEGym servers.
-
-Ported from jetrl_django_idegym/reward/idegym_runner.py.
 """
 
 import asyncio
@@ -15,6 +13,8 @@ from typing import Any, Optional
 
 import aiohttp
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 from idegym.api.exceptions import IdeGYMException
 from idegym.api.orchestrator.servers import ServerReuseStrategy
 from idegym.api.tools.bash import BashCommandResponse
@@ -23,6 +23,7 @@ from idegym.client.server import IdeGYMServer
 from kubernetes_asyncio.client import V1ResourceRequirements
 
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
+from examples.django_idegym.utils.postprocessing import extract_bash_output
 
 load_dotenv()
 
@@ -43,13 +44,13 @@ def with_timeout_and_retry(max_retries: int = 3, retry_delay: float = 1.0, timeo
                     asyncio.TimeoutError,
                     ConnectionError,
                 ) as e:
-                    print(f"[WARNING] Attempt {attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
                     if attempt == max_retries - 1:
-                        print("[WARNING] Could not run the command with IDEGYM. Exiting.")
+                        logger.warning("Could not run the command with IDEGYM. Exiting.")
                         raise
                     await asyncio.sleep(retry_delay)
                 except Exception as e:
-                    print(f"[ERROR] Non-retryable error: {type(e).__name__}: {e}")
+                    logger.error(f"Non-retryable error: {type(e).__name__}: {e}")
                     raise e
 
         return wrapper
@@ -124,11 +125,11 @@ class IDEGymRunner:
                 "IDEGYM_AUTH_PASSWORD/BASIC_AUTH_PASSWORD must be provided."
             )
 
-        print("[INFO] Initializing IDEGymRunner")
+        logger.info("Initializing IDEGymRunner")
 
     async def create_client(self) -> IdeGYMClient:
         """Create and initialize an IDEGYM client."""
-        logging.debug(f"[INFO] Initializing IDEGYM client '{self.client_name}'")
+        logger.debug(f"Initializing IDEGYM client '{self.client_name}'")
         client = IdeGYMClient(
             name=self.client_name,
             orchestrator_url=self.orchestrator_url,
@@ -137,23 +138,23 @@ class IDEGymRunner:
         )
         await asyncio.wait_for(client.health_check(), timeout=self.client_start_timeout)
         await asyncio.wait_for(client.__aenter__(), timeout=self.client_start_timeout)
-        logging.debug(f"[INFO] IDEGYM client '{self.client_name}' initialized successfully")
+        logger.debug(f"IDEGYM client '{self.client_name}' initialized successfully")
         return client
 
     async def close_client(self, client: Optional[IdeGYMClient]) -> None:
         """Stop the IDEGYM client and clean up resources."""
         if client is None:
             return
-        print(f"[INFO] Finalizing IDEGYM client '{client.name}'")
+        logger.info(f"Finalizing IDEGYM client '{client.name}'")
         try:
             await asyncio.wait_for(client.__aexit__(None, None, None), timeout=self.client_start_timeout)
-            print(f"[INFO] IDEGYM client '{client.name}' finalized successfully")
+            logger.info(f"IDEGYM client '{client.name}' finalized successfully")
         except Exception as e:
-            print(f"[ERROR] Error finalizing IDEGYM client: {e}")
+            logger.error(f"Error finalizing IDEGYM client: {e}")
 
     async def create_server(self, client: IdeGYMClient) -> IdeGYMServer:
         """Create a new IDEGYM server instance."""
-        logging.debug(f"[INFO] Creating server '{self.server_name}' with image {self.image_tag}")
+        logger.debug(f"Creating server '{self.server_name}' with image {self.image_tag}")
         server = await client._create_server(
             image_tag=self.image_tag,
             server_name=self.server_name,
@@ -162,24 +163,18 @@ class IDEGymRunner:
             server_start_wait_timeout_in_seconds=self.server_start_timeout,
             reuse_strategy=ServerReuseStrategy.RESET,
         )
-        logging.debug(f"[INFO] Successfully created server {self.server_name}: {server.server_id}")
+        logger.debug(f"Successfully created server {self.server_name}: {server.server_id}")
         return server
 
     async def finish_server(self, server: IdeGYMServer) -> None:
         """Stop and clean up a server instance."""
         try:
-            print(f"[INFO] Stopping server {server.server_id}")
+            logger.info(f"Stopping server {server.server_id}")
             await asyncio.wait_for(server._finish_server(), timeout=self.client_start_timeout)
-            print(f"[INFO] Server {server.server_id} finished successfully")
+            logger.info(f"Server {server.server_id} finished successfully")
         except Exception as e:
-            print(f"[ERROR] Error finishing server {server.server_id}: {e}")
+            logger.error(f"Error finishing server {server.server_id}: {e}")
 
-    @staticmethod
-    def _extract_output(cmd_output: BashCommandResponse) -> str:
-        """Extracts and combines stdout and stderr from the command output."""
-        stdout = cmd_output.stdout or ""
-        stderr = cmd_output.stderr or ""
-        return f"{stdout}\n{stderr}".strip()
 
     async def run_bash(self, server: IdeGYMServer, command: str) -> dict[str, Any]:
         """Execute a bash command on the given server."""
@@ -227,8 +222,8 @@ class IDEGymRunner:
         test_result = await server.execute_bash(script=test_command, command_timeout=self.test_command_timeout)
         time_test = time.perf_counter() - time_start
 
-        test_output = self._extract_output(test_result)
-        edited_file = self._extract_output(cat_res)
+        test_output = extract_bash_output(test_result)
+        edited_file = extract_bash_output(cat_res)
 
         time_total = time.perf_counter() - time_start_global
 
@@ -253,7 +248,7 @@ class IDEGymRunner:
             request_timeout=self.edit_timeout,
         )
         cat_res = await server.execute_bash(script=f"cat {item.file_path}", command_timeout=self.short_bash_cmd_timeout)
-        edited_file = self._extract_output(cat_res)
+        edited_file = extract_bash_output(cat_res)
         return {
             "server_id": server.server_id,
             "edited_file": edited_file,
@@ -265,4 +260,4 @@ class IDEGymRunner:
             reset_timeout=self.reset_timeout,
             graceful_termination_timeout=5.0,
         )
-        print(f"[INFO] Reset server {server.server_id}")
+        logger.info(f"Reset server {server.server_id}")

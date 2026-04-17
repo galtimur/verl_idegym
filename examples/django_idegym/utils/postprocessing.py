@@ -1,7 +1,30 @@
 import re
-from typing import Any
+from typing import Any, Optional
+from idegym.api.tools.bash import BashCommandResponse
 
-from examples.django_idegym.utils.reward_helper_fns import extract_code_block
+# Each output is either a float score or a dict containing a score key and some extra data
+RewardOutput = float | dict
+
+
+def extract_code_block(text: str, language: str = "python") -> Optional[str]:
+    """Extract a code block delimited by triple backticks with the given language identifier."""
+    match = re.search(rf"```{language}\s+(.*?)```", text, re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
+def apply_reasoning_filter(content: str, max_turns: int) -> str:
+    """Remove a leading <think>...</think> reasoning trace from content string."""
+    filtered, num_substitutions = re.subn(r"^.*?</think>", "", content, flags=re.DOTALL)
+    if num_substitutions > 0:
+        return filtered.strip("\n")
+
+    stripped = content.strip()
+    if stripped.startswith("<think>"):
+        return (
+            content if max_turns == 1 else "The thinking was too long. I should be more concise next time."
+        )
+
+    return content
 
 
 def normalize_indent(code: str) -> str:
@@ -34,6 +57,24 @@ def strip_decorators(code: str) -> str:
             is_method_body = True
         lines_without_decorator.append(line)
     return "\n".join(lines_without_decorator)
+
+
+def normalize_code_for_comparison(code: str) -> str:
+    """Normalize indent and strip decorators — common prep for similarity/test comparison."""
+    return strip_decorators(normalize_indent(code))
+
+
+def extract_bash_output(cmd_output: BashCommandResponse | dict) -> str:
+    """Combine stdout and stderr into a single output string."""
+    if isinstance(cmd_output, dict):
+        stdout = cmd_output.get("stdout")
+        stderr= cmd_output.get("stderr")
+    elif isinstance(cmd_output, BashCommandResponse):
+        stdout = cmd_output.stdout or ''
+        stderr = cmd_output.stderr or ''
+    else:
+        raise ValueError(f"Invalid command output type: {type(cmd_output)}")
+    return f"{stdout}\n{stderr}".strip()
 
 
 def is_good_start(code: str, method_name: str) -> bool:

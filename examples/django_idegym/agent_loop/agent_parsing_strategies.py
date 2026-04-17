@@ -1,7 +1,5 @@
 """
 Parsing strategies for SweMini agent: toolcall vs text-based command extraction.
-
-Ported from jetrl_django_idegym/scaffold/agent_parsing_strategies.py.
 """
 
 from __future__ import annotations
@@ -15,8 +13,6 @@ from jinja2 import StrictUndefined, Template
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 
 logger = logging.getLogger(__name__)
-
-MSWEA_BLOCK_RE = re.compile(r"```mswea_bash_command\s*\n(.*?)```", re.DOTALL)
 
 BASH_TOOL = {
     "name": "bash",
@@ -100,21 +96,6 @@ def strip_thinking(content: str) -> str:
     """Strip <think>...</think> blocks from content."""
     filtered, num_subs = re.subn(r"^.*?</think>", "", content, flags=re.DOTALL)
     return filtered.strip("\n") if num_subs > 0 else content
-
-
-def extract_commands_from_message(msg: dict) -> list[str]:
-    """Extract bash commands from a stored agent message dict."""
-    commands: list[str] = []
-    for tc in msg.get("tool_calls", []):
-        if tc.get("name") == "bash":
-            cmd = tc.get("args", {}).get("command", "")
-            if cmd:
-                commands.append(cmd)
-    if commands:
-        return commands
-    content = msg.get("content", "")
-    commands.extend(m.group(1).strip() for m in MSWEA_BLOCK_RE.finditer(content))
-    return commands
 
 
 class ParsingStrategy(ABC):

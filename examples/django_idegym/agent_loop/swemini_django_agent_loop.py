@@ -30,10 +30,11 @@ from examples.django_idegym.agent_loop.agent_parsing_strategies import (
 from examples.django_idegym.prompts.swemini_prompts import load_prompts
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
 from examples.django_idegym.utils.postprocessing import (
+    apply_reasoning_filter,
+    extract_bash_output,
     get_percentage_passed,
     parse_idegym_tests_output,
 )
-from examples.django_idegym.utils.reward_helper_fns import apply_reasoning_filter
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_parser import ToolParser
 
@@ -71,14 +72,6 @@ def count_decorators_above(file_lines: list[str], def_line_idx: int) -> int:
     return count
 
 
-def trim_messages(messages: list[dict]) -> list[dict]:
-    """Remove middle messages when context overflows. Keep first 2 + rest after dropping 2."""
-    start = messages[:2]
-    end = messages[2:]
-    end = end[2:]
-    return start + end
-
-
 # ---------------------------------------------------------------------------
 # SWEMiniDjangoAgentLoop — registered for verl
 # ---------------------------------------------------------------------------
@@ -96,24 +89,23 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
 
         rollout_cfg = self.rollout_config
-        custom = getattr(rollout_cfg, "custom", None) or {}
 
-        self.max_turns = kwargs.get("max_turns", custom.get("max_turns", 10))
-        self.max_num_tests = kwargs.get("max_num_tests", custom.get("max_num_tests", 10))
-        self.max_test_output_symb = kwargs.get("max_test_output_symb", custom.get("max_test_output_symb", 10_000))
-        self.enable_thinking = kwargs.get("enable_thinking", custom.get("enable_thinking", False))
+        self.max_turns = kwargs.get("max_turns", 10)
+        self.max_num_tests = kwargs.get("max_num_tests", 10)
+        self.max_test_output_symb = kwargs.get("max_test_output_symb", 10_000)
+        self.enable_thinking = kwargs.get("enable_thinking", False)
 
-        keep_reasoning = kwargs.get("keep_reasoning", custom.get("keep_reasoning", "none"))
+        keep_reasoning = kwargs.get("keep_reasoning", "none")
         if keep_reasoning not in KEEP_REASONING_OPTIONS:
             keep_reasoning = "none"
         self.keep_reasoning = keep_reasoning
 
         # Parsing mode
-        agent_parsing_mode = kwargs.get("agent_parsing_mode", custom.get("agent_parsing_mode", "toolcall"))
+        agent_parsing_mode = kwargs.get("agent_parsing_mode", "toolcall")
         self.agent_parsing_mode = agent_parsing_mode
 
         # Prompts
-        prompts_file = kwargs.get("prompts_file", custom.get("prompts_file", None))
+        prompts_file = kwargs.get("prompts_file", None)
         self.agent_prompts = load_prompts(agent_parsing_mode, prompts_file)
 
         self._jinja_env = JinjaEnvironment(undefined=StrictUndefined)
@@ -135,11 +127,11 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             self.apply_chat_template_kwargs = {**self.apply_chat_template_kwargs, "enable_thinking": True}
 
         # IDEGym runner
-        use_mock_runner = kwargs.get("use_mock_runner", custom.get("use_mock_runner", False))
+        use_mock_runner = kwargs.get("use_mock_runner", False)
         if use_mock_runner:
             from examples.django_idegym.agent_loop.mock_idegym_runner import MockIDEGymRunner
-            mock_error_rate = kwargs.get("mock_runner_error_rate", custom.get("mock_runner_error_rate", 0.001))
-            mock_pass_rate = kwargs.get("mock_runner_pass_rate", custom.get("mock_runner_pass_rate", 0.7))
+            mock_error_rate = kwargs.get("mock_runner_error_rate", 0.001)
+            mock_pass_rate = kwargs.get("mock_runner_pass_rate", 0.7)
             logger.info(f"[SCAFFOLD] Using MockIDEGymRunner (error_rate={mock_error_rate}, pass_rate={mock_pass_rate})")
             self.idegym_runner = MockIDEGymRunner(error_rate=mock_error_rate, pass_rate=mock_pass_rate)
         else:
@@ -190,9 +182,7 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
 
     def _render_observation(self, result: dict[str, Any]) -> str:
         cmd_output = result.get("command_output", {})
-        stdout = cmd_output.get("stdout", "") or ""
-        stderr = cmd_output.get("stderr", "") or ""
-        output = f"{stdout}\n{stderr}".strip()
+        output = extract_bash_output(cmd_output)
         out_obj = {
             "returncode": int(cmd_output.get("exit_code", 0)),
             "output": output,

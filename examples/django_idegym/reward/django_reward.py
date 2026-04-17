@@ -1,16 +1,18 @@
 import asyncio
+import logging
 import os
 
 import aiohttp
 
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
+
+logger = logging.getLogger(__name__)
 from examples.django_idegym.utils.postprocessing import (
     code_blocks_distance,
     extract_and_clean_code_block,
     is_good_start,
-    normalize_indent,
+    normalize_code_for_comparison,
     process_test_result_for_reward_computation,
-    strip_decorators,
 )
 
 IDEGYM_SERVER__URL = os.environ.get(
@@ -51,10 +53,6 @@ def _default(component: tuple) -> float:
 RC = DjangoRewardComponents
 
 
-def get_empty_feedback(*args, **kwargs) -> dict | None:
-    return None
-
-
 async def get_idegym_feedback_async(
     item: ItemToRun,
     do_edit: bool = True,
@@ -81,16 +79,16 @@ async def get_idegym_feedback_async(
                 if response.status == 200:
                     return await response.json()
                 else:
-                    print(
-                        f"[ERROR] Failed to retrieve data, status code: {response.status}, "
+                    logger.error(
+                        f"Failed to retrieve data, status code: {response.status}, "
                         f"item was:\n {item.to_dict()}"
                     )
                     return None
     except (asyncio.TimeoutError, aiohttp.ServerTimeoutError):
-        print(f"[ERROR] Request timed out after {timeout} seconds for item: {item.to_dict()}")
+        logger.error(f"Request timed out after {timeout} seconds for item: {item.to_dict()}")
         return None
     except Exception as e:
-        print(f"[ERROR] Request failed with exception: {e} for item: {item.to_dict()}")
+        logger.error(f"Request failed with exception: {e} for item: {item.to_dict()}")
         return None
 
 
@@ -130,16 +128,16 @@ def compute_django_reward_components_from_code_and_tests(
         Dictionary of reward components
     """
     if code_block is None:
-        print("[DEBUG] code block is None")
+        logger.debug("code block is None")
         return {_key(RC.NO_CODE_SCORE): _default(RC.NO_CODE_SCORE)}
 
     code_block = code_block.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not code_block.strip():
-        print("[DEBUG] code block is empty")
+        logger.debug("code block is empty")
         return {_key(RC.NO_CODE_SCORE): _default(RC.NO_CODE_SCORE)}
 
     if item_dict is None:
-        print("[DEBUG] item_dict is None")
+        logger.debug("item_dict is None")
         return {_key(RC.NO_CODE_SCORE): _default(RC.NO_CODE_SCORE)}
 
     method_code = item_dict["method"]["declaration"] + "\n" + item_dict["method"]["body"]
@@ -149,8 +147,7 @@ def compute_django_reward_components_from_code_and_tests(
     good_start = is_good_start(code=code_block, method_name=method_name)
 
     # Normalize and strip decorators for similarity calculation
-    code_block_norm = normalize_indent(code_block)
-    code_block_for_similarity = strip_decorators(code_block_norm)
+    code_block_for_similarity = normalize_code_for_comparison(code_block)
     code_distance = code_blocks_distance(code_block_for_similarity, method_code)
     reward_similarity = _default(RC.SIMILARITY_SCORE) * (1 - code_distance)
 
@@ -186,7 +183,7 @@ def compute_django_reward_components_from_code_and_tests(
     passed_tests = total_tests - (details.get("failures", 0) + details.get("errors", 0))
     passed_percentage = (passed_tests / total_tests) if total_tests > 0 else 0.0
 
-    print(f"[DEBUG] passed_percentage: {passed_percentage}")
+    logger.debug(f"passed_percentage: {passed_percentage}")
 
     failed_score = _default(RC.FAILED_TEST_SCORE)
     passed_score = _default(RC.PASSED_TEST_SCORE)
@@ -227,16 +224,15 @@ async def get_idegym_reward_components_async(
     """Calculate reward for Django method generation based on test results (async version)."""
     code_block = extract_and_clean_code_block(solution_str)
     if code_block is None:
-        print("[DEBUG] code block is None")
+        logger.debug("code block is None")
         return {_key(RC.NO_CODE_SCORE): _default(RC.NO_CODE_SCORE)}
 
     item_dict = extra_info.get("tools_kwargs", {}).get("item", None)
     if item_dict is None:
-        print("[ERROR] No item found in extra_info")
+        logger.error("No item found in extra_info")
         return {_key(RC.PIPELINE_ERROR_SCORE): _default(RC.PIPELINE_ERROR_SCORE)}
 
-    code_for_tests = normalize_indent(code_block)
-    code_for_tests = strip_decorators(code_for_tests)
+    code_for_tests = normalize_code_for_comparison(code_block)
     item_to_run: ItemToRun = ItemToRun.from_item(
         item_dict, replace=code_for_tests, max_num_tests=extra_info.get("max_num_tests", 10)
     )
@@ -244,7 +240,7 @@ async def get_idegym_reward_components_async(
 
     test_result_processed = process_test_result_for_reward_computation(test_result)
     if test_result_processed is None:
-        print("[DEBUG] test result is None or could not be processed")
+        logger.debug("test result is None or could not be processed")
         return {_key(RC.PIPELINE_ERROR_SCORE): _default(RC.PIPELINE_ERROR_SCORE)}
 
     return compute_django_reward_components_from_code_and_tests(
@@ -281,7 +277,7 @@ async def _get_idegym_rewards_async_impl(
     processed_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            print(f"[ERROR] Task {i} failed with exception: {result}")
+            logger.error(f"Task {i} failed with exception: {result}")
             error_reward = {_key(c): 0.0 for c in RC._ALL}
             error_reward[_key(RC.PIPELINE_ERROR_SCORE)] = _default(RC.PIPELINE_ERROR_SCORE)
             result = get_score_dict_with_score_key(error_reward)
