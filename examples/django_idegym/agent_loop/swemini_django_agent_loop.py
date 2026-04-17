@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 SUBMIT_SIGNAL = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 FAILED_PIPELINE_SCORE = 0
 
-KEEP_REASONING_OPTIONS = {"none", "last", "all"}
+KEEP_REASONING_OPTIONS = {"none", "all"} # "last",
 
 _CONTAINER_SYSTEM_INFO = {
     "system": "Linux",
@@ -355,7 +355,7 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             return
 
         # Apply reasoning filter
-        if self.keep_reasoning in {"none", "last"}:
+        if self.keep_reasoning in {"none"}:
             content = apply_reasoning_filter(content, self.max_turns)
 
         # Store raw response
