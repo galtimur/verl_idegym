@@ -155,7 +155,7 @@ class IDEGymRunner:
     async def create_server(self, client: IdeGYMClient) -> IdeGYMServer:
         """Create a new IDEGYM server instance."""
         logger.debug(f"Creating server '{self.server_name}' with image {self.image_tag}")
-        server = await client._create_server(
+        server = await client.start_server(
             image_tag=self.image_tag,
             server_name=self.server_name,
             namespace=self.namespace,

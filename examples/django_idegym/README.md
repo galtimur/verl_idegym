@@ -31,9 +31,9 @@ Each `agent_step`:
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[vllm]"
+uv pip install idegym-{tools,api,backend-utils,client,common-utils,rewards,image-builder}==0.8.0
 uv pip install langchain-core langgraph aiohttp pyyaml pytest "datasets>=3.6"
-uv pip install flash-attn --no-build-isolation # Can take long time
-uv pip install idegym-{tools,api,backend-utils,client,common-utils,rewards}==0.7.3
+uv pip install flash-attn --no-build-isolation
 ```
 
 For testing without IDEGym, set `use_mock_runner: true` in the config.

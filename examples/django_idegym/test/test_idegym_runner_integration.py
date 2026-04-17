@@ -165,27 +165,30 @@ class TestRunTests:
 # Notebook-style smoke test (create client/server, run bash, teardown)
 # ---------------------------------------------------------------------------
 
+import time
+
 GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
 
 
-def _print_result(name: str, ok: bool) -> None:
+def _print_result(name: str, ok: bool, elapsed: float) -> None:
     status = f"{GREEN}PASSED{RESET}" if ok else f"{RED}FAILED{RESET}"
-    print(f"{name} {status}")
+    print(f"{name:<20} {status}  ({elapsed:.3f}s)")
 
 
 def test_idegym_smoke():
     """End-to-end smoke: create client+server, run echo hello, verify, teardown."""
-    results: list[tuple[str, bool]] = []
+    results: list[tuple[str, bool, float]] = []
 
     async def _step(name: str, coro):
+        t0 = time.perf_counter()
         try:
             value = await coro
-            results.append((name, True))
+            results.append((name, True, time.perf_counter() - t0))
             return value
         except Exception as e:
-            results.append((name, False))
+            results.append((name, False, time.perf_counter() - t0))
             raise e
 
     async def _run():
@@ -210,5 +213,7 @@ def test_idegym_smoke():
         asyncio.run(_run())
     finally:
         print("\n" + 70 * "-")
-        for name, ok in results:
-            _print_result(name, ok)
+        for name, ok, elapsed in results:
+            _print_result(name, ok, elapsed)
+        total = sum(e for _, _, e in results)
+        print(f"{'TOTAL':<20}         {total:.3f}s")
