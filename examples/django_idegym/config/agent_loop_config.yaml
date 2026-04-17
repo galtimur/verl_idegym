@@ -7,4 +7,4 @@
   keep_reasoning: "none"
   agent_parsing_mode: "toolcall"
   prompts_file: null
-  trajectory_dir: null
+  trajectory_dir: logs/trajectories

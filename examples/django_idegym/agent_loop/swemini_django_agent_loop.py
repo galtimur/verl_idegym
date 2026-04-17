@@ -10,6 +10,7 @@ After the agent submits (or max turns), tests are run and rewards computed.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -132,9 +133,9 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         trajectory_dir = kwargs.get("trajectory_dir", None)
         if trajectory_dir:
             os.makedirs(trajectory_dir, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            experiment_name = getattr(getattr(self.trainer_config, "trainer", None), "experiment_name", "default")
-            filename = f"traj_django_swemini_{experiment_name}_{timestamp}.jsonl"
+            # timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+            experiment_name = getattr(getattr(self.config, "trainer", None), "experiment_name", "default")
+            filename = f"traj_django_swemini_{experiment_name}.jsonl"
             self.traj_local_path = os.path.join(trajectory_dir, filename)
             logger.info(f"[SCAFFOLD] Trajectories will be saved to {self.traj_local_path}")
 
@@ -587,14 +588,20 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             "dp_id": dp_item.get("dp_id") if dp_item else None,
             "dp_idx": dp_item.get("idx") if dp_item else None,
         }
+        state.pop("prompt_ids")
+        state.pop("response_mask")
+        state.pop("request_id")
 
         # Save trajectory to local file
         if self.traj_local_path:
             try:
-                state_to_save = {k: v for k, v in state.items() if k not in ("server", "client")}
                 with open(self.traj_local_path, "a", encoding="utf-8") as f:
-                    json.dump(state_to_save, f, default=str)
-                    f.write("\n")
+                    fcntl.flock(f, fcntl.LOCK_EX)
+                    try:
+                        json.dump(state, f, default=str)
+                        f.write("\n")
+                    finally:
+                        fcntl.flock(f, fcntl.LOCK_UN)
             except Exception as e:
                 logger.error(f"[FINALIZE] dp_id={dp_id} - Failed to save trajectory locally: {e}")
 
