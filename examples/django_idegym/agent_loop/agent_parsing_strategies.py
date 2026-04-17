@@ -10,21 +10,30 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from types import SimpleNamespace
-from typing import Any
-
-# ---------------------------------------------------------------------------
-# Vendored from minisweagent to avoid external dependency
-# ---------------------------------------------------------------------------
 from jinja2 import StrictUndefined, Template
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
 
+from verl.experimental.agent_loop.tool_parser import FunctionCall
+
+logger = logging.getLogger(__name__)
+
+MSWEA_BLOCK_RE = re.compile(r"```mswea_bash_command\s*\n(.*?)```", re.DOTALL)
+
+BASH_TOOL = {
+    "name": "bash",
+    "description": "Execute a bash command",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "The bash command to execute",
+            }
+        },
+        "required": ["command"],
+    },
+}
+
+BASH_TOOL_OPENAI = {"type": "function", "function": BASH_TOOL}
 
 class FormatError(Exception):
     """Raised when the LM's output is not in the expected format."""
@@ -50,9 +59,9 @@ def parse_regex_actions(content: str, *, action_regex: str, format_error_templat
     return [{"command": action} for action in actions]
 
 
-def parse_toolcall_actions(tool_calls: list, *, format_error_template: str) -> list[dict]:
-    """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args."""
-    if not tool_calls:
+def parse_toolcall_actions(function_calls: list[FunctionCall], *, format_error_template: str) -> list[dict]:
+    """Parse FunctionCall objects from ToolParser. Raises FormatError if unknown tool or invalid args."""
+    if not function_calls:
         raise FormatError(
             {
                 "role": "user",
@@ -63,15 +72,15 @@ def parse_toolcall_actions(tool_calls: list, *, format_error_template: str) -> l
             }
         )
     actions = []
-    for tool_call in tool_calls:
+    for fc in function_calls:
         error_msg = ""
         args = {}
         try:
-            args = json.loads(tool_call.function.arguments)
+            args = json.loads(fc.arguments)
         except Exception as e:
             error_msg = f"Error parsing tool call arguments: {e}. "
-        if tool_call.function.name != "bash":
-            error_msg += f"Unknown tool '{tool_call.function.name}'."
+        if fc.name != "bash":
+            error_msg += f"Unknown tool '{fc.name}'."
         if "command" not in args:
             error_msg += "Missing 'command' argument in bash tool call."
         if error_msg:
@@ -83,35 +92,14 @@ def parse_toolcall_actions(tool_calls: list, *, format_error_template: str) -> l
                     ),
                 }
             )
-        actions.append({"command": args["command"], "tool_call_id": tool_call.id})
+        actions.append({"command": args["command"], "tool_call_id": fc.name})
     return actions
 
-logger = logging.getLogger(__name__)
 
-MSWEA_BLOCK_RE = re.compile(r"```mswea_bash_command\s*\n(.*?)```", re.DOTALL)
-
-BASH_TOOL = {
-    "name": "bash",
-    "description": "Execute a bash command",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The bash command to execute",
-            }
-        },
-        "required": ["command"],
-    },
-}
-
-
-def get_message_content(message: AIMessage) -> str:
-    """Get content of an AI message, stripping <think>...</think> blocks."""
-    raw_content = str(message.content)
-    filtered, num_subs = re.subn(r"^.*?</think>", "", raw_content, flags=re.DOTALL)
-    content = filtered.strip("\n") if num_subs > 0 else raw_content
-    return content
+def strip_thinking(content: str) -> str:
+    """Strip <think>...</think> blocks from content."""
+    filtered, num_subs = re.subn(r"^.*?</think>", "", content, flags=re.DOTALL)
+    return filtered.strip("\n") if num_subs > 0 else content
 
 
 def extract_commands_from_message(msg: dict) -> list[str]:
@@ -129,81 +117,31 @@ def extract_commands_from_message(msg: dict) -> list[str]:
     return commands
 
 
-def adapt_lc_tool_calls(lc_tool_calls: list[dict]) -> list[SimpleNamespace]:
-    """Convert LangChain tool-call dicts to the litellm-style objects
-    expected by ``parse_toolcall_actions``."""
-    return [
-        SimpleNamespace(
-            id=tc.get("id", ""),
-            function=SimpleNamespace(
-                name=tc.get("name", ""),
-                arguments=json.dumps(tc.get("args", {})),
-            ),
-        )
-        for tc in lc_tool_calls
-    ]
-
-
-def convert_messages(strategy: ParsingStrategy, agent_messages: list[dict]) -> list[BaseMessage]:
-    return [strategy.convert_msg_to_lc(msg) for msg in agent_messages]
-
-
 class ParsingStrategy(ABC):
     """Abstracts the differences between toolcall and text parsing modes."""
 
     @abstractmethod
-    def bind_engine(self, engine):
-        """Optionally bind tools to the LLM engine."""
-
-    @abstractmethod
-    def parse_actions(self, message: AIMessage) -> list[dict]:
+    def parse_actions(self, content: str, function_calls: list[FunctionCall]) -> list[dict]:
         """Parse commands from model response. Raises FormatError on bad format."""
 
     @abstractmethod
-    def build_assistant_msg(self, message: AIMessage) -> dict:
-        """Build an internal assistant message dict from model response."""
-
-    @abstractmethod
     def build_observation_msgs(self, actions: list[dict], observations: list[str]) -> list[dict]:
-        """Build observation messages to append to conversation."""
-
-    @abstractmethod
-    def convert_msg_to_lc(self, msg: dict) -> BaseMessage:
-        """Convert an internal message dict to a LangChain message object."""
+        """Build observation messages (plain dicts) to append to conversation."""
 
     @abstractmethod
     def get_tools(self) -> list[dict]:
-        """Get the tools available for the model."""
+        """Get tool schemas in OpenAI format for apply_chat_template."""
 
 
 class ToolcallStrategy(ParsingStrategy):
     def __init__(self, format_error_template: str):
         self._format_error_template = format_error_template
-        self._tools = [BASH_TOOL]
 
-    def bind_engine(self, engine):
-        return engine.bind_tools(self._tools)
-
-    def parse_actions(self, message: AIMessage) -> list[dict]:
-        adapted = adapt_lc_tool_calls(message.tool_calls or [])
+    def parse_actions(self, content: str, function_calls: list[FunctionCall]) -> list[dict]:
         return parse_toolcall_actions(
-            adapted,
+            function_calls,
             format_error_template=self._format_error_template,
         )
-
-    def build_assistant_msg(self, message: AIMessage) -> dict:
-        content = get_message_content(message)
-        msg: dict[str, Any] = {"role": "assistant", "content": content}
-        if message.tool_calls:
-            msg["tool_calls"] = [
-                {
-                    "id": tc.get("id", ""),
-                    "name": tc.get("name", ""),
-                    "args": tc.get("args", {}),
-                }
-                for tc in message.tool_calls
-            ]
-        return msg
 
     def build_observation_msgs(self, actions: list[dict], observations: list[str]) -> list[dict]:
         msgs: list[dict] = []
@@ -217,22 +155,8 @@ class ToolcallStrategy(ParsingStrategy):
             )
         return msgs
 
-    def convert_msg_to_lc(self, msg: dict) -> BaseMessage:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
-            return SystemMessage(content=content)
-        if role == "assistant":
-            if msg.get("tool_calls"):
-                tc_list = [{**tc, "type": "tool_call"} for tc in msg["tool_calls"]]
-                return AIMessage(content=content, tool_calls=tc_list)
-            return AIMessage(content=content)
-        if role == "tool":
-            return ToolMessage(content=content, tool_call_id=msg.get("tool_call_id", ""))
-        return HumanMessage(content=content)
-
-    def get_tools(self) -> list:
-        return self._tools
+    def get_tools(self) -> list[dict]:
+        return [BASH_TOOL_OPENAI]
 
 
 class TextStrategy(ParsingStrategy):
@@ -240,22 +164,14 @@ class TextStrategy(ParsingStrategy):
 
     def __init__(self, format_error_template: str):
         self._format_error_template = format_error_template
-        self._tools = []
 
-    def bind_engine(self, engine):
-        return engine
-
-    def parse_actions(self, message: AIMessage) -> list[dict]:
-        content = get_message_content(message)
+    def parse_actions(self, content: str, function_calls: list[FunctionCall]) -> list[dict]:
+        cleaned = strip_thinking(content)
         return parse_regex_actions(
-            content,
+            cleaned,
             action_regex=self._ACTION_REGEX,
             format_error_template=self._format_error_template,
         )
-
-    def build_assistant_msg(self, message: AIMessage) -> dict:
-        content = get_message_content(message)
-        return {"role": "assistant", "content": content}
 
     def build_observation_msgs(self, actions: list[dict], observations: list[str]) -> list[dict]:
         combined = (
@@ -265,14 +181,5 @@ class TextStrategy(ParsingStrategy):
             return []
         return [{"role": "user", "content": combined}]
 
-    def convert_msg_to_lc(self, msg: dict) -> BaseMessage:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "system":
-            return SystemMessage(content=content)
-        if role == "assistant":
-            return AIMessage(content=content)
-        return HumanMessage(content=content)
-
-    def get_tools(self) -> list:
-        return self._tools
+    def get_tools(self) -> list[dict]:
+        return []

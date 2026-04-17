@@ -1,35 +1,25 @@
 """
 Django IDEGym SweMini agent loop for verl.
 
-Implements a LangGraph-based agentic workflow:
-  initialize → agent_step (loop) → run_tests → finalize → END
+Implements a multi-turn agentic workflow using verl's LLM server directly:
+  initialize → agent_step (loop) → run_tests → finalize
 
 The model generates bash commands executed on a persistent IDEGym server.
 After the agent submits (or max turns), tests are run and rewards computed.
-
-Ported from jetrl_django_idegym/scaffold/django_swemini_agent.py.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 import traceback
 import uuid
-from copy import deepcopy
-from dataclasses import asdict, is_dataclass
 from datetime import datetime
-from functools import partial
-from typing import Annotated, Any, Sequence, TypedDict
+from typing import Any
 
 from jinja2 import Environment as JinjaEnvironment
 from jinja2 import StrictUndefined
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, convert_to_openai_messages
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, StateGraph
-from openai import BadRequestError
 
 from examples.django_idegym.agent_loop.agent_parsing_strategies import (
     FormatError,
@@ -37,7 +27,6 @@ from examples.django_idegym.agent_loop.agent_parsing_strategies import (
     TextStrategy,
     ToolcallStrategy,
 )
-from examples.django_idegym.agent_loop.chat_model import ChatModel, MaxTokenExceededError, convert_to_agent_output
 from examples.django_idegym.prompts.swemini_prompts import load_prompts
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
 from examples.django_idegym.utils.postprocessing import (
@@ -46,6 +35,7 @@ from examples.django_idegym.utils.postprocessing import (
 )
 from examples.django_idegym.utils.reward_helper_fns import apply_reasoning_filter
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
+from verl.experimental.agent_loop.tool_parser import ToolParser
 
 logger = logging.getLogger(__name__)
 
@@ -67,19 +57,6 @@ _CONTAINER_SYSTEM_INFO = {
 # ---------------------------------------------------------------------------
 
 
-def dataclass_to_dict(obj: Any) -> Any:
-    """Convert dataclass objects / BaseMessages to dictionaries recursively."""
-    if isinstance(obj, BaseMessage):
-        return {"type": obj.__class__.__name__, "content": str(obj.content)}
-    if is_dataclass(obj):
-        return asdict(obj)
-    if isinstance(obj, dict):
-        return {key: dataclass_to_dict(value) for key, value in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [dataclass_to_dict(item) for item in obj]
-    return obj
-
-
 def count_decorators_above(file_lines: list[str], def_line_idx: int) -> int:
     """Count @decorator lines immediately above a function definition."""
     count = 0
@@ -94,22 +71,7 @@ def count_decorators_above(file_lines: list[str], def_line_idx: int) -> int:
     return count
 
 
-def get_fallback_message(message: str, role: str = "ai") -> AIMessage | HumanMessage:
-    """Create a placeholder message with dummy response_metadata for failed generations."""
-    # prompt_ids must contain both prompt and response tokens;
-    # response_mask marks which tokens are the response.
-    # Use two dummy tokens so prompt_ids[:len-len(mask)] is non-empty.
-    metadata = {
-        "request_id": str(uuid.uuid4()),
-        "prompt_ids": [0, 0],
-        "response_mask": [0],
-    }
-    if role == "ai":
-        return AIMessage(content=message, response_metadata=metadata)
-    return HumanMessage(content=message)
-
-
-def trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+def trim_messages(messages: list[dict]) -> list[dict]:
     """Remove middle messages when context overflows. Keep first 2 + rest after dropping 2."""
     start = messages[:2]
     end = messages[2:]
@@ -118,211 +80,22 @@ def trim_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 
 # ---------------------------------------------------------------------------
-# State TypedDict for LangGraph
-# ---------------------------------------------------------------------------
-
-
-class SweMiniState(TypedDict):
-    """State passed between the nodes of the LangGraph."""
-    messages: Annotated[Sequence[BaseMessage], "Conversation messages"]
-    responses_raw: Annotated[Sequence[BaseMessage | str], "Raw LLM responses"]
-    test_results: list[dict]
-    test_status: str | None
-    generated_code_blocks: list[str]
-    turn: Annotated[int, "Current turn number"]
-    max_turns: Annotated[int, "Maximum turns allowed"]
-    should_continue: bool | None
-    stop_reason: str | None
-    dp_item: dict | None
-    edited_file: list[str]
-    no_code_block: bool | None
-    test_passed: bool | None
-    test_output: str | None
-    tests_passed_percentage: float | None
-    turn_exit: int | None
-    timestamp_start: str | None
-    timestamp_end: str | None
-    duration: float | None
-    turn_tests_durations: list[float] | None
-    turn_gen_durations: list[float] | None
-    reward_components: dict | None
-    rm_score: float | None
-    # SweMini-specific fields
-    client: Any | None
-    server: Any | None
-    server_id: str | None
-    server_init_failed: float | None
-    is_failed_rollout: bool | None
-    trajectory: list[dict]
-    metadata: dict | None
-    submit_mode: str | None
-    tools_kwargs: dict | None
-    extra_info: dict | None
-
-
-# ---------------------------------------------------------------------------
-# CustomChatModel with enable_thinking support
-# ---------------------------------------------------------------------------
-
-
-class CustomChatModel(ChatModel):
-    """ChatModel subclass that supports extended thinking via enable_thinking flag."""
-
-    enable_thinking: bool = False
-
-    def __init__(self, *args, **kwargs):
-        enable_thinking = kwargs.pop("enable_thinking", False)
-        super().__init__(*args, **kwargs)
-        self.enable_thinking = enable_thinking
-
-    async def _preprocess(self, messages: list[BaseMessage], **kwargs: Any) -> tuple[str, list[int], list[int]]:
-        assert messages[-1].type in ["human", "tool"], (
-            f"Last message must be human or tool, but got {messages[-1].type}"
-        )
-        loop = asyncio.get_running_loop()
-
-        if messages[-1].type == "human" and (len(messages) == 1 or messages[-2].type != "ai"):
-            prompt_ids = await loop.run_in_executor(
-                None,
-                lambda: self.tokenizer.apply_chat_template(
-                    convert_to_openai_messages(messages),
-                    tools=kwargs.get("tools"),
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    enable_thinking=self.enable_thinking,
-                ),
-            )
-            return str(uuid.uuid4()), prompt_ids, []
-
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].type == "ai":
-                break
-        assert "prompt_ids" in messages[i].response_metadata
-        assert "response_mask" in messages[i].response_metadata
-
-        tool_responses = convert_to_openai_messages(messages[i + 1 :])
-        tool_response_ids = await loop.run_in_executor(
-            None,
-            lambda messages=tool_responses: self.tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True, enable_thinking=self.enable_thinking,
-            ),
-        )
-        tool_response_ids = tool_response_ids[len(kwargs["system_prompt"]) :]
-
-        if len(messages[i].response_metadata["response_mask"]) + len(tool_response_ids) >= self.max_tokens:
-            raise MaxTokenExceededError(f"Max response length {self.max_tokens} exceeded")
-
-        request_id = messages[i].response_metadata.pop("request_id")
-        prompt_ids = messages[i].response_metadata.pop("prompt_ids")
-        response_mask = messages[i].response_metadata.pop("response_mask")
-        prompt_ids += tool_response_ids
-        response_mask += [0] * len(tool_response_ids)
-
-        return request_id, prompt_ids, response_mask
-
-
-# ---------------------------------------------------------------------------
-# call_model node
-# ---------------------------------------------------------------------------
-
-
-async def call_model(
-    state: SweMiniState,
-    model: ChatModel,
-    sampling_params: dict,
-    keep_reasoning: str = "none",
-    max_turns: int = 10,
-    enable_trim: bool = True,
-) -> SweMiniState:
-    """Query LLM with current messages. Handles context trimming and errors."""
-    start_time = time.perf_counter()
-    messages = list(state["messages"])
-
-    dp_item = state.get("dp_item")
-    if dp_item is None:
-        state["should_continue"] = False
-        state["stop_reason"] = "no_dp_item"
-        state["is_failed_rollout"] = True
-        return state
-
-    item_idx = dp_item.get("idx", "?")
-
-    while True:
-        new_message, status, caught_exception = await _run_model(messages, model, sampling_params)
-        if status in ["context_too_long", "max_tokens_exceeded"] and enable_trim and len(messages) > 2:
-            logger.info(f"Trimming context for item idx={item_idx}, turn={state['turn']}")
-            messages = trim_messages(messages)
-        else:
-            break
-
-    state["turn_gen_durations"].append(time.perf_counter() - start_time)
-
-    if new_message is None:
-        state["should_continue"] = False
-        state["test_status"] = None
-        state["is_failed_rollout"] = True
-        responses_raw = list(state["responses_raw"])
-        responses_raw.append(str(caught_exception))
-        state["responses_raw"] = responses_raw
-        fallback = get_fallback_message(f"Generation failed: {caught_exception}", role="ai")
-        state["messages"].append(fallback)
-        return state
-
-    messages = list(state["messages"])
-    responses_raw = list(state["responses_raw"])
-    responses_raw.append(deepcopy(new_message))
-    state["responses_raw"] = responses_raw
-
-    if keep_reasoning in {"none", "last"}:
-        apply_reasoning_filter(new_message, max_turns)
-
-    messages.append(new_message)
-    state["messages"] = messages
-    state["should_continue"] = True
-    return state
-
-
-async def _run_model(
-    messages: Sequence[BaseMessage], model: ChatModel, sampling_params: dict[str, Any]
-) -> tuple[AIMessage | None, str, Any]:
-    caught_exception = ""
-    new_message = None
-    try:
-        new_message = await model.ainvoke(messages, sampling_params=sampling_params)
-        status = "success"
-    except MaxTokenExceededError as e:
-        caught_exception = e
-        print(f"Max response length exceeded: {e}")
-        status = "max_tokens_exceeded"
-    except BadRequestError as e:
-        caught_exception = e
-        if "maximum context length" in str(e):
-            print(f"Context too long: {e}")
-            status = "context_too_long"
-        else:
-            print(f"Generation error occurred: {e}")
-            status = "error"
-    except Exception as e:
-        caught_exception = e
-        print(f"Generation error occurred: {e}")
-        status = "error"
-    return new_message, status, caught_exception
-
-
-# ---------------------------------------------------------------------------
-# SWEMiniDjangoAgentLoop — SweMini-based, registered for verl
+# SWEMiniDjangoAgentLoop — registered for verl
 # ---------------------------------------------------------------------------
 
 
 @register("django_agent_loop")
 class SWEMiniDjangoAgentLoop(AgentLoopBase):
-    """SweMini-style multi-turn Django agent loop with IDEGym server interaction."""
+    """SweMini-style multi-turn Django agent loop with IDEGym server interaction.
+
+    Uses verl's AsyncLLMServerManager directly instead of a LangChain ChatModel wrapper.
+    Tracks prompt_ids and response_mask explicitly for RL training.
+    """
 
     def __init__(self, trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
 
         rollout_cfg = self.rollout_config
-        # Prefer agent_loop_config kwargs; fall back to rollout_cfg.custom for backward compat
         custom = getattr(rollout_cfg, "custom", None) or {}
 
         self.max_turns = kwargs.get("max_turns", custom.get("max_turns", 10))
@@ -354,6 +127,13 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         else:
             raise KeyError(f"Unknown agent_parsing_mode: {agent_parsing_mode}. Use: toolcall or text")
 
+        # Tool parser for decoding LLM response tokens
+        self._tool_parser = ToolParser.get_tool_parser(rollout_cfg.multi_turn.format, self.tokenizer)
+
+        # Override apply_chat_template_kwargs to pass enable_thinking
+        if self.enable_thinking:
+            self.apply_chat_template_kwargs = {**self.apply_chat_template_kwargs, "enable_thinking": True}
+
         # IDEGym runner
         use_mock_runner = kwargs.get("use_mock_runner", custom.get("use_mock_runner", False))
         if use_mock_runner:
@@ -365,7 +145,6 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         else:
             from examples.django_idegym.agent_loop.idegym_runner import IDEGymRunner
             self.idegym_runner = IDEGymRunner()
-
 
     # --- Prompt rendering ---
 
@@ -426,10 +205,13 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             head_tail_length=self.max_test_output_symb // 2,
         )
 
-    async def _generate_messages(self, dp_item: dict) -> list[BaseMessage]:
+    def _generate_messages(self, dp_item: dict) -> list[dict]:
         system_prompt = self._jinja_render(self.agent_prompts["system_template"])
         user_prompt = self._render_instance_prompt(dp_item)
-        return [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        return [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
 
     # --- ItemToRun builder ---
 
@@ -455,21 +237,19 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             tests=tests,
         )
 
-    # --- Graph nodes ---
+    # --- Initialize ---
 
-    async def _initialize(self, state: SweMiniState, config: RunnableConfig) -> SweMiniState:
-        """Node: Create IDEGym server and cut the target method."""
-        agent_config = config["configurable"]["agent_config"]
+    async def _initialize(self, state: dict) -> None:
+        """Create IDEGym server and cut the target method."""
         init_start_time = time.perf_counter()
 
         # Initialize state defaults
-        state["responses_raw"] = list(state.get("responses_raw", []))
+        state["responses_raw"] = []
         state["test_results"] = []
         state["test_status"] = None
         state["generated_code_blocks"] = []
         state["turn"] = 0
-        state["max_turns"] = agent_config["max_turns"]
-        state["should_continue"] = None
+        state["should_continue"] = False
         state["stop_reason"] = None
         state["edited_file"] = []
         state["no_code_block"] = None
@@ -492,21 +272,17 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         state["trajectory"] = []
         state["metadata"] = None
         state["submit_mode"] = None
-        state["tools_kwargs"] = {}
-        state["extra_info"] = {}
 
-        item = state["dp_item"]
+        item = state.get("dp_item")
         if item is None:
-            state["should_continue"] = False
             state["is_failed_rollout"] = True
             state["stop_reason"] = "no_dp_item"
-            state["messages"] = [get_fallback_message("No datapoint provided.", role="ai")]
-            return state
+            return
 
         dp_id = item["dp_id"]
 
         # Generate initial messages
-        state["messages"] = await self._generate_messages(item)
+        state["messages"] = self._generate_messages(item)
 
         # Create client
         try:
@@ -514,12 +290,10 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             state["client"] = client
         except Exception as e:
             logger.error(f"[INIT] dp_id={dp_id} - Failed to create client: {e}")
-            state["should_continue"] = False
             state["is_failed_rollout"] = True
             state["stop_reason"] = "initialization_error"
             state["server_init_failed"] = 1.0
-            state["messages"].append(get_fallback_message("Failed initialize test client.", role="ai"))
-            return state
+            return
 
         # Create server
         try:
@@ -533,12 +307,10 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             except Exception:
                 pass
             state["client"] = None
-            state["should_continue"] = False
             state["is_failed_rollout"] = True
             state["stop_reason"] = "initialization_error"
             state["server_init_failed"] = 1.0
-            state["messages"].append(get_fallback_message("Failed initialize test server.", role="ai"))
-            return state
+            return
 
         # Cut the target method
         item_to_cut = self.build_item(item, code="")
@@ -551,64 +323,55 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             await self.idegym_runner.close_client(client)
             state["client"] = None
             state["server"] = None
-            state["should_continue"] = False
             state["is_failed_rollout"] = True
             state["stop_reason"] = "initialization_error"
             state["server_init_failed"] = 1.0
-            state["messages"].append(get_fallback_message("Failed initialize test server.", role="ai"))
-            return state
+            return
 
         state["should_continue"] = True
         logger.info(f"[INIT] dp_id={dp_id} - Initialize completed in {time.perf_counter() - init_start_time:.2f}s")
-        return state
 
-    async def _agent_step(self, state: SweMiniState, config: RunnableConfig, model) -> SweMiniState:
-        """Node: One iteration of the agent loop."""
-        agent_config = config["configurable"]["agent_config"]
-        sampling_params = config["configurable"]["sampling_params"]
+    # --- Agent step ---
 
+    async def _agent_step(self, state: dict, sampling_params: dict) -> None:
+        """One iteration of the agent loop: generate, parse, execute."""
         state["turn"] += 1
         step = state["turn"]
 
         if step > self.max_turns:
             state["stop_reason"] = "max_turns_reached"
             state["should_continue"] = False
-            return state
+            return
 
-        # Call model
-        state = await call_model(
-            state, model=model, sampling_params=sampling_params,
-            keep_reasoning=agent_config["keep_reasoning"],
-            max_turns=agent_config["max_turns"],
-            enable_trim=False,
-        )
+        # Generate
+        start_time = time.perf_counter()
+        content, function_calls = await self._call_model(state, sampling_params)
+        state["turn_gen_durations"].append(time.perf_counter() - start_time)
 
-        if not state["should_continue"]:
-            return state
+        if content is None:
+            # Generation failed, _call_model already set is_failed_rollout
+            return
 
-        messages = state["messages"]
-        if not messages:
-            state["stop_reason"] = "empty_messages"
-            state["should_continue"] = False
-            state["is_failed_rollout"] = True
-            messages.append(get_fallback_message("No messages in the state.", role="ai"))
-            return state
+        # Apply reasoning filter
+        if self.keep_reasoning in {"none", "last"}:
+            content = apply_reasoning_filter(content, self.max_turns)
 
-        message: AIMessage = messages[-1]
+        # Store raw response
+        state["responses_raw"].append({"content": content, "function_calls": function_calls})
 
         # Parse actions
         try:
-            actions = self._strategy.parse_actions(message)
+            actions = self._strategy.parse_actions(content, function_calls)
         except FormatError as e:
-            if not e.messages:
-                fallback = get_fallback_message("Format error occurred, please try again.", role="user")
-            else:
-                fallback = get_fallback_message(e.messages[0]["content"], role="user")
             if step < self.max_turns:
-                messages.append(fallback)
+                if e.messages:
+                    state["messages"].append({"role": "user", "content": e.messages[0]["content"]})
+                else:
+                    state["messages"].append({"role": "user", "content": "Format error occurred, please try again."})
+                # Encode observation and append to prompt
+                await self._append_observation_tokens(state, state["messages"][-1:])
             state["should_continue"] = True
-            state["messages"] = messages
-            return state
+            return
         except Exception:
             traceback.print_exc()
             raise
@@ -619,20 +382,75 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
 
         if stop:
             state["should_continue"] = False
-            state["messages"] = messages
-            return state
+            return
 
-        # Build observation messages
-        obs_msgs = [
-            self._strategy.convert_msg_to_lc(msg)
-            for msg in self._strategy.build_observation_msgs(actions, observations)
-        ]
-        messages.extend(obs_msgs)
-        state["messages"] = messages
+        # Build observation messages and append to conversation
+        obs_msgs = self._strategy.build_observation_msgs(actions, observations)
+        state["messages"].extend(obs_msgs)
+        await self._append_observation_tokens(state, obs_msgs)
         state["should_continue"] = True
-        return state
 
-    async def _execute_commands(self, commands: list[str], state: SweMiniState) -> tuple[list[str], bool]:
+    async def _call_model(self, state: dict, sampling_params: dict) -> tuple[str | None, list]:
+        """Call verl LLM server. Returns (content, function_calls) or (None, []) on failure."""
+        messages = state["messages"]
+        tools = self._strategy.get_tools() or None
+
+        # Tokenize: initial turn encodes full history, follow-up appends observation tokens
+        if "prompt_ids" not in state:
+            # First call: encode full message history
+            prompt_ids = await self.apply_chat_template(messages, tools=tools)
+            state["prompt_ids"] = prompt_ids
+            state["response_mask"] = []
+            state["request_id"] = uuid.uuid4().hex
+
+        prompt_ids = state["prompt_ids"]
+        request_id = state["request_id"]
+
+        try:
+            output = await self.server_manager.generate(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+            )
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            state["should_continue"] = False
+            state["is_failed_rollout"] = True
+            return None, []
+
+        response_ids = output.token_ids
+
+        # Accumulate trajectory
+        state["prompt_ids"] = prompt_ids + response_ids
+        state["response_mask"] = state["response_mask"] + [1] * len(response_ids)
+
+        # Check response length limit
+        if len(state["response_mask"]) >= self.rollout_config.response_length:
+            state["should_continue"] = False
+            state["stop_reason"] = "max_response_length"
+
+        # Decode response
+        content, function_calls = await self._tool_parser.extract_tool_calls(response_ids)
+
+        # Add assistant message to conversation history
+        assistant_msg = {"role": "assistant", "content": content}
+        if function_calls:
+            assistant_msg["tool_calls"] = [
+                {"name": fc.name, "args": json.loads(fc.arguments)} for fc in function_calls
+            ]
+        state["messages"].append(assistant_msg)
+
+        return content, function_calls
+
+    async def _append_observation_tokens(self, state: dict, obs_msgs: list[dict]) -> None:
+        """Encode observation messages and append to prompt_ids with mask=0."""
+        if not obs_msgs:
+            return
+        obs_ids = await self.apply_chat_template(obs_msgs, remove_system_prompt=True)
+        state["prompt_ids"] = state["prompt_ids"] + obs_ids
+        state["response_mask"] = state["response_mask"] + [0] * len(obs_ids)
+
+    async def _execute_commands(self, commands: list[str], state: dict) -> tuple[list[str], bool]:
         """Execute bash commands sequentially via IDEGym."""
         server = state["server"]
         step = state["turn"]
@@ -658,7 +476,6 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
                     state["test_status"] = "CRUSHED"
                     state["should_continue"] = False
                     state["is_failed_rollout"] = True
-                    state["messages"].append(get_fallback_message("IDEGYM error during bash command.", role="ai"))
                     return observations, True
                 error_msg = f"Command execution failed: {type(e).__name__}: {e}"
                 tpl = self.agent_prompts["format_error_template"]
@@ -672,14 +489,16 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
 
         return observations, False
 
-    async def _run_tests(self, state: SweMiniState) -> SweMiniState:
-        """Node: Run tests on the server after agent submission."""
+    # --- Run tests ---
+
+    async def _run_tests(self, state: dict) -> None:
+        """Run tests on the server after agent submission."""
         item = state["dp_item"]
         dp_id = item["dp_id"]
         server = state["server"]
 
         if state["test_status"] == "CRUSHED":
-            return state
+            return
 
         item_to_test = self.build_item(item, code="")
         try:
@@ -698,8 +517,6 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             traceback.print_exc()
             state["test_status"] = "CRUSHED"
 
-        return state
-
     def _parse_test_result(self, raw_result: dict[str, Any]) -> dict[str, Any]:
         test_output = raw_result.get("test_output", "")
         raw_result.pop("datapoint", None)
@@ -714,7 +531,9 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         raw_result["test_output"] = test_output
         return raw_result
 
-    def _calculate_reward_score(self, state: SweMiniState) -> dict:
+    # --- Finalize ---
+
+    def _calculate_reward_score(self, state: dict) -> dict:
         test_results = state.get("test_results", [])
         test_result = test_results[-1] if test_results else {}
         percentage_passed = test_result.get("percentage_passed", 0.0)
@@ -724,22 +543,14 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             "score": percentage_passed,
         }
 
-    async def _finalize(self, state: SweMiniState) -> SweMiniState:
-        """Node: Stop server, compute reward, save trajectory."""
+    async def _finalize(self, state: dict) -> None:
+        """Stop server, compute reward, save trajectory."""
         server = state.get("server")
         client = state.get("client")
         dp_id = state["dp_item"]["dp_id"] if state.get("dp_item") else "unknown"
 
-        # Strip trailing non-AI messages beyond max_turns
-        step = state["turn"]
-        if step > self.max_turns:
-            messages = state["messages"]
-            while messages and messages[-1].type != "ai":
-                messages.pop()
-            state["messages"] = messages
-
         if server is None and client is None:
-            return state
+            return
 
         state["timestamp_end"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if state.get("timestamp_start"):
@@ -775,23 +586,9 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             "dp_idx": dp_item.get("idx") if dp_item else None,
         }
 
-        # if self.traj_bucket and self.fs:
-        #     try:
-        #         state_dict = dataclass_to_dict(copy.deepcopy(state))
-        #         for mes in state_dict.get("messages", []):
-        #             if isinstance(mes, dict):
-        #                 mes.pop("response_metadata", None)
-        #         with self.fs.open(self.traj_bucket, "a", encoding="utf-8") as f:
-        #             json.dump(state_dict, f)
-        #             f.write("\n")
-        #     except Exception as e:
-        #         logger.error(f"[FINALIZE] dp_id={dp_id} - Failed to upload trajectory: {e}")
-
-        return state
-
     # --- Trajectory recording ---
 
-    def _record(self, state: SweMiniState, action: str, result: dict | None, **extra: Any) -> None:
+    def _record(self, state: dict, action: str, result: dict | None, **extra: Any) -> None:
         server_id = -1
         result_keys = []
         success = False
@@ -808,84 +605,70 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             "result_keys": result_keys,
         })
 
-    # --- Graph construction ---
-
-    def _build_graph(self, model) -> Any:
-        workflow = StateGraph(SweMiniState)
-
-        agent_step_with_model = partial(self._agent_step, model=model)
-
-        workflow.add_node("initialize", self._initialize)
-        workflow.add_node("agent_step", agent_step_with_model)
-        workflow.add_node("run_tests", self._run_tests)
-        workflow.add_node("finalize", self._finalize)
-
-        workflow.add_conditional_edges(
-            "initialize",
-            lambda s: s["should_continue"],
-            {True: "agent_step", False: "finalize"},
-        )
-        workflow.add_conditional_edges(
-            "agent_step",
-            lambda s: s["should_continue"],
-            {True: "agent_step", False: "run_tests"},
-        )
-        workflow.add_edge("run_tests", "finalize")
-        workflow.add_edge("finalize", END)
-
-        workflow.set_entry_point("initialize")
-        return workflow.compile()
-
     # --- verl AgentLoopBase interface ---
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         dp_item = kwargs.get("dp_item") or kwargs.get("tools_kwargs", {}).get("item")
 
-        model_path = self.config.actor_rollout_ref.model.path
-        model_name = "/".join(model_path.split("/")[-2:])
+        state: dict[str, Any] = {"dp_item": dp_item, "messages": messages}
 
-        rollout = self.rollout_config
-        model = CustomChatModel(
-            model=model_name,
-            client=self.server_manager,
-            tokenizer=self.tokenizer,
-            max_tokens=rollout.response_length,
-            max_parallel_calls=rollout.multi_turn.max_parallel_calls,
-            tool_parser=rollout.multi_turn.format,
-            enable_thinking=self.enable_thinking,
+        # Initialize
+        await self._initialize(state)
+
+        # Agent loop
+        while state["should_continue"]:
+            await self._agent_step(state, sampling_params)
+
+        # Run tests
+        if state.get("dp_item") and not state.get("is_failed_rollout"):
+            await self._run_tests(state)
+
+        # Finalize
+        await self._finalize(state)
+
+        # Build output
+        return self._build_output(state)
+
+    def _build_output(self, state: dict) -> AgentLoopOutput:
+        """Convert state to AgentLoopOutput for verl training."""
+        response_length = self.rollout_config.response_length
+
+        prompt_ids = state.get("prompt_ids", [0, 0])
+        response_mask = state.get("response_mask", [0])
+
+        if not response_mask:
+            # No generation happened (failed rollout) — use dummy tokens
+            prompt_ids = [0, 0]
+            response_mask = [0]
+
+        # Split prompt_ids into prompt and response parts using response_mask
+        response_ids = prompt_ids[-len(response_mask):]
+        prompt_only_ids = prompt_ids[:len(prompt_ids) - len(response_mask)]
+
+        # Count turns from messages
+        num_turns = 0
+        prev_role = None
+        for msg in state.get("messages", []):
+            role = msg.get("role") if isinstance(msg, dict) else "unknown"
+            if role == "system":
+                continue
+            if role != prev_role:
+                num_turns += 1
+                prev_role = role
+
+        output = AgentLoopOutput(
+            prompt_ids=prompt_only_ids,
+            response_ids=response_ids[:response_length],
+            response_mask=response_mask[:response_length],
+            num_turns=num_turns,
+            metrics={},
         )
 
-        # Bind tools based on parsing strategy
-        model = self._strategy.bind_engine(model)
-
-        config = {
-            "configurable": {
-                "sampling_params": sampling_params,
-                "agent_config": {
-                    "max_turns": self.max_turns,
-                    "max_num_tests": self.max_num_tests,
-                    "max_test_output_symb": self.max_test_output_symb,
-                    "keep_reasoning": self.keep_reasoning,
-                },
-            }
-        }
-
-        graph = self._build_graph(model)
-
-        graph_input: dict[str, Any] = {"messages": messages}
-        if dp_item is not None:
-            graph_input["dp_item"] = dp_item
-
-        state = await graph.ainvoke(input=graph_input, config=config)
-
-        # Convert to AgentLoopOutput
-        output = convert_to_agent_output(state["messages"], rollout.response_length)
-
         # Propagate reward
-        output.reward_score = float(state["rm_score"]) if state["rm_score"] is not None else None
+        output.reward_score = float(state["rm_score"]) if state.get("rm_score") is not None else None
         default_reward_info = {"percentage_passed": 0.0, "efficiency": 0.0, "score": 0.0}
-        if state["reward_components"]:
+        if state.get("reward_components"):
             reward_info = dict(state["reward_components"])
             reward_info.setdefault("percentage_passed", 0.0)
             reward_info.setdefault("score", 0.0)
