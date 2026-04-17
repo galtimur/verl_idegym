@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+
 from jinja2 import StrictUndefined, Template
 
 from verl.experimental.agent_loop.tool_parser import FunctionCall
@@ -126,7 +127,7 @@ class ToolcallStrategy(ParsingStrategy):
 
     def build_observation_msgs(self, actions: list[dict], observations: list[str]) -> list[dict]:
         msgs: list[dict] = []
-        for action, obs in zip(actions, observations):
+        for action, obs in zip(actions, observations, strict=True):
             msgs.append(
                 {
                     "role": "tool",

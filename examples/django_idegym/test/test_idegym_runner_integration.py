@@ -13,6 +13,7 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -164,8 +165,6 @@ class TestRunTests:
 # ---------------------------------------------------------------------------
 # Notebook-style smoke test (create client/server, run bash, teardown)
 # ---------------------------------------------------------------------------
-
-import time
 
 GREEN = "\033[32m"
 RED = "\033[31m"

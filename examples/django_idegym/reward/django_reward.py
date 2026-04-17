@@ -5,8 +5,6 @@ import os
 import aiohttp
 
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
-
-logger = logging.getLogger(__name__)
 from examples.django_idegym.utils.postprocessing import (
     code_blocks_distance,
     extract_and_clean_code_block,
@@ -14,6 +12,8 @@ from examples.django_idegym.utils.postprocessing import (
     normalize_code_for_comparison,
     process_test_result_for_reward_computation,
 )
+
+logger = logging.getLogger(__name__)
 
 IDEGYM_SERVER__URL = os.environ.get(
     "IDEGYM_SERVER_URL", "http://idegym-django-api.ml4se.svc.cluster.local:7778/run_item"

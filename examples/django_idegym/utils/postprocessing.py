@@ -1,5 +1,6 @@
 import re
 from typing import Any, Optional
+
 from idegym.api.tools.bash import BashCommandResponse
 
 # Each output is either a float score or a dict containing a score key and some extra data

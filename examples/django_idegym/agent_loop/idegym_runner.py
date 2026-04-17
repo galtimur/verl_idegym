@@ -13,11 +13,8 @@ from typing import Any, Optional
 
 import aiohttp
 from dotenv import load_dotenv
-
-logger = logging.getLogger(__name__)
 from idegym.api.exceptions import IdeGYMException
 from idegym.api.orchestrator.servers import ServerReuseStrategy
-from idegym.api.tools.bash import BashCommandResponse
 from idegym.client.client import IdeGYMClient
 from idegym.client.server import IdeGYMServer
 from kubernetes_asyncio.client import V1ResourceRequirements
@@ -25,6 +22,7 @@ from kubernetes_asyncio.client import V1ResourceRequirements
 from examples.django_idegym.reward.idegym_runner_utils import ItemToRun
 from examples.django_idegym.utils.postprocessing import extract_bash_output
 
+logger = logging.getLogger(__name__)
 load_dotenv()
 
 

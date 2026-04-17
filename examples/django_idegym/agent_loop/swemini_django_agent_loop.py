@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import traceback
 import uuid
@@ -122,9 +123,20 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
         # Tool parser for decoding LLM response tokens
         self._tool_parser = ToolParser.get_tool_parser(rollout_cfg.multi_turn.format, self.tokenizer)
 
-        # Override apply_chat_template_kwargs to pass enable_thinking
-        if self.enable_thinking:
-            self.apply_chat_template_kwargs = {**self.apply_chat_template_kwargs, "enable_thinking": True}
+        # Override apply_chat_template_kwargs to pass enable_thinking.
+        # Always propagate it so models like Qwen3 can suppress thinking blocks when False.
+        self.apply_chat_template_kwargs = {**self.apply_chat_template_kwargs, "enable_thinking": self.enable_thinking}
+
+        # Local trajectory saving
+        self.traj_local_path = None
+        trajectory_dir = kwargs.get("trajectory_dir", None)
+        if trajectory_dir:
+            os.makedirs(trajectory_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            experiment_name = getattr(getattr(self.trainer_config, "trainer", None), "experiment_name", "default")
+            filename = f"traj_django_swemini_{experiment_name}_{timestamp}.jsonl"
+            self.traj_local_path = os.path.join(trajectory_dir, filename)
+            logger.info(f"[SCAFFOLD] Trajectories will be saved to {self.traj_local_path}")
 
         # IDEGym runner
         use_mock_runner = kwargs.get("use_mock_runner", False)
@@ -575,6 +587,16 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             "dp_id": dp_item.get("dp_id") if dp_item else None,
             "dp_idx": dp_item.get("idx") if dp_item else None,
         }
+
+        # Save trajectory to local file
+        if self.traj_local_path:
+            try:
+                state_to_save = {k: v for k, v in state.items() if k not in ("server", "client")}
+                with open(self.traj_local_path, "a", encoding="utf-8") as f:
+                    json.dump(state_to_save, f, default=str)
+                    f.write("\n")
+            except Exception as e:
+                logger.error(f"[FINALIZE] dp_id={dp_id} - Failed to save trajectory locally: {e}")
 
     # --- Trajectory recording ---
 
