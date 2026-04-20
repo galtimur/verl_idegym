@@ -3,15 +3,6 @@ from typing import Any, Optional
 
 from idegym.api.tools.bash import BashCommandResponse
 
-# Each output is either a float score or a dict containing a score key and some extra data
-RewardOutput = float | dict
-
-
-def extract_code_block(text: str, language: str = "python") -> Optional[str]:
-    """Extract a code block delimited by triple backticks with the given language identifier."""
-    match = re.search(rf"```{language}\s+(.*?)```", text, re.DOTALL)
-    return match.group(1).strip() if match else None
-
 
 def apply_reasoning_filter(content: str, max_turns: int) -> str:
     """Remove a leading <think>...</think> reasoning trace from content string."""
@@ -28,43 +19,6 @@ def apply_reasoning_filter(content: str, max_turns: int) -> str:
     return content
 
 
-def normalize_indent(code: str) -> str:
-    # assumes the first line is the function definition
-    code = code.strip("\n")
-    lines = code.splitlines()
-    line = lines[0]
-    indent_len = len(line) - len(line.lstrip())
-    # Remove up to indent_len spaces from the start of every line
-    normalized = [line[indent_len:] if len(line) >= indent_len else "" for line in lines]
-    return "\n".join(normalized)
-
-
-def strip_decorators(code: str) -> str:
-    """
-    Remove leading decorators that directly precede a function definition.
-    Keeps the rest of the code unchanged.
-    """
-    if not code:
-        return code
-
-    lines = code.splitlines()
-    lines = [line for line in lines if line.strip()]
-    lines_without_decorator = []
-    is_method_body = False
-    for line in lines:
-        if line.strip().startswith("@") and not is_method_body:
-            continue
-        else:
-            is_method_body = True
-        lines_without_decorator.append(line)
-    return "\n".join(lines_without_decorator)
-
-
-def normalize_code_for_comparison(code: str) -> str:
-    """Normalize indent and strip decorators — common prep for similarity/test comparison."""
-    return strip_decorators(normalize_indent(code))
-
-
 def extract_bash_output(cmd_output: BashCommandResponse | dict) -> str:
     """Combine stdout and stderr into a single output string."""
     if isinstance(cmd_output, dict):
@@ -76,16 +30,6 @@ def extract_bash_output(cmd_output: BashCommandResponse | dict) -> str:
     else:
         raise ValueError(f"Invalid command output type: {type(cmd_output)}")
     return f"{stdout}\n{stderr}".strip()
-
-
-def is_good_start(code: str, method_name: str) -> bool:
-    method_dec = f"def {method_name}"
-    method_dec_async = f"async def {method_name}"
-    # allow starting with decorators immediately preceding the function
-    # e.g., @decorator(args)
-    stripped = code.strip()
-    good_start = stripped.startswith((method_dec, method_dec_async)) or stripped.startswith("@")
-    return good_start
 
 
 def parse_idegym_tests_output(output: str) -> dict[str, Any]:
@@ -148,99 +92,6 @@ def parse_idegym_tests_output(output: str) -> dict[str, Any]:
     return {"tests": results, "summary": summary_info}
 
 
-def strip_comments_and_whitespace(code: str) -> str:
-    """Remove comments and whitespace from code for comparison purposes."""
-    # Remove single-line comments (Python)
-    code = re.sub(r"#.*", "", code)
-    # Remove multiline comments (Python)
-    code = re.sub(r"'''(.|\n)*?'''", "", code)
-    code = re.sub(r'"""(.|\n)*?"""', "", code)
-    # Strip whitespace and blank lines
-    code = "\n".join(line for line in code.splitlines() if line.strip())
-    return code.strip()
-
-
-def levenshtein(s1: str, s2: str) -> int:
-    """Calculate Levenshtein distance between two strings."""
-    # Optimize: ensure s1 is the longer string
-    if len(s1) < len(s2):
-        return levenshtein(s2, s1)
-    if len(s2) == 0:
-        return len(s1)
-    previous_row = list(range(len(s2) + 1))
-    for i, c1 in enumerate(s1):
-        current_row = [i + 1]
-        for j, c2 in enumerate(s2):
-            insertions = previous_row[j + 1] + 1
-            deletions = current_row[j] + 1
-            substitutions = previous_row[j] + (c1 != c2)
-            current_row.append(min(insertions, deletions, substitutions))
-        previous_row = current_row
-    return previous_row[-1]
-
-
-def normalized_levenshtein(a: str, b: str) -> float:
-    """Calculate normalized Levenshtein distance (0.0 to 1.0)."""
-    ed = levenshtein(a, b)
-    norm = ed / max(len(a), len(b)) if max(len(a), len(b)) > 0 else 0.0
-    return norm
-
-
-def code_blocks_distance(code1: str, code2: str) -> float:
-    """Calculate normalized distance between two code blocks after removing comments and whitespace."""
-    clean1 = strip_comments_and_whitespace(code1)
-    clean2 = strip_comments_and_whitespace(code2)
-    return normalized_levenshtein(clean1, clean2)
-
-
-def extract_and_clean_code_block(solution_str: str) -> str | None:
-    """
-    Extract and clean code block from solution string.
-
-    Args:
-        solution_str: The solution string that may contain code blocks
-
-    Returns:
-        Cleaned code block or None if no code block found
-    """
-    # Filtering possible think block
-    solution_str = re.sub(
-        r"^.*?</think>", "", str(solution_str), flags=re.DOTALL
-    ).strip("\n")
-    # Extract code block from solution string
-    code_block = extract_code_block(solution_str, "python")
-    if code_block is None:
-        return None
-
-    # Clean up the code block
-    code_block = code_block.replace("\r\n", "\n")
-    code_block = code_block.replace("\r", "\n")
-    code_block = code_block.strip("\n")
-
-    return code_block if code_block.strip() else None
-
-
-def process_test_result_for_reward_computation(test_result: dict | None) -> dict | None:
-    """
-    Process test result into the format expected by
-    compute_django_reward_components_from_code_and_tests.
-    """
-    if test_result is None:
-        return None
-
-    # If external caller passed a pre-processed test dict with summary/details, use it directly
-    if "summary" in test_result:
-        return test_result
-
-    # Otherwise parse test_output into a processed structure
-    test_output = test_result.get("test_output", "")
-    if not test_output:
-        return None
-
-    parsed = parse_idegym_tests_output(test_output)
-    return {"summary": parsed.get("summary"), "details": parsed.get("tests")}
-
-
 def get_percentage_passed(test_results: dict) -> float:
     """Extract test pass percentage from a processed test result dict."""
     summary = test_results.get("summary", {})
@@ -251,6 +102,7 @@ def get_percentage_passed(test_results: dict) -> float:
     if (details is None) or (total_tests is None) or (total_tests == 0):
         return 0.0
 
+    # Guard against under-reported total_tests
     total_tests = max((details.get("failures", 0) + details.get("errors", 0)), total_tests)
     passed_tests = total_tests - (details.get("failures", 0) + details.get("errors", 0))
     return (passed_tests / total_tests) if total_tests > 0 else 0.0

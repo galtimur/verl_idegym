@@ -356,7 +356,7 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
             return
 
         # Apply reasoning filter
-        if self.keep_reasoning in {"none"}:
+        if self.keep_reasoning == "none":
             content = apply_reasoning_filter(content, self.max_turns)
 
         # Store raw response
@@ -408,6 +408,12 @@ class SWEMiniDjangoAgentLoop(AgentLoopBase):
 
         prompt_ids = state["prompt_ids"]
         request_id = state["request_id"]
+
+        # Stop early if no response budget remains (vLLM requires max_tokens >= 1)
+        if len(state["response_mask"]) >= self.rollout_config.response_length:
+            state["should_continue"] = False
+            state["stop_reason"] = "max_response_length"
+            return None, []
 
         try:
             output = await self.server_manager.generate(
