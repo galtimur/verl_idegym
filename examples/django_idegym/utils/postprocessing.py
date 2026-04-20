@@ -1,5 +1,5 @@
 import re
-from typing import Any, Optional
+from typing import Any
 
 from idegym.api.tools.bash import BashCommandResponse
 
